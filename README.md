@@ -1,120 +1,175 @@
 # Auxlo
 
-> Like autoresearch but for agent engineering. Give an AI agent a task, let it build and iterate on an agent harness autonomously overnight. It modifies the system prompt, tools, agent configuration, and orchestration, runs the benchmark, checks the score, keeps or discards the change, and repeats.
+> Self-evolving autonomous agent that improves itself. Add tasks, let it run, watch it get smarter.
 
 Auxlo is an autonomous agent engineering framework built by [Auxlo](https://auxlo.xyz).
 
-## How it works
-
-The repo has a few files and directories that matter:
-
-- **`auxlo.py`** -- the entire harness under test in a single file. It contains
-  config, tool definitions, agent registry, routing/orchestration, and the
-  Harbor adapter boundary. The adapter section is explicitly marked as fixed;
-  the rest is the primary edit surface for the meta-agent.
-- **`program.md`** -- instructions for the meta-agent + the directive (what
-  kind of agent to build). **This file is edited by the human**.
-- **`tasks/`** -- evaluation tasks in
-  [harbor](https://github.com/laude-institute/harbor) format. In a clean
-  baseline branch, benchmark payloads may be omitted and added in
-  benchmark-specific branches.
-- **`.agent/`** -- optional workspace artifacts for reusable instructions,
-  notes, prompts, or skills.
-
-The metric is total **score** produced by the benchmark's task test suites. The
-meta-agent hill-climbs on this score.
-
-## Quick start
-
-**Requirements:** Docker, Python 3.12+
+## Quick Start
 
 ```bash
-# Install dependencies
+# Clone
+git clone https://github.com/larsontrey720/auxlo.git
 cd auxlo
-uv sync
 
-# Build the base image
-docker build -f Dockerfile.base -t auxlo-base .
+# Configure (optional - uses env vars by default)
+auxlo config --api-key your-api-key
+auxlo config --model stepfun-ai/step-3.5-flash
 
-# Run a single task
-rm -rf jobs; mkdir -p jobs && uv run harbor run -p tasks/ --task-name "<task-name>" -l 1 -n 1 --agent-import-path auxlo:Auxlo -o jobs --job-name latest > run.log 2>&1
+# Add tasks and run
+auxlo add "Write a Python script that prints hello"
+auxlo run
 
-# Run all tasks in parallel (-n = concurrency, default 4)
-rm -rf jobs; mkdir -p jobs && uv run harbor run -p tasks/ -n 100 --agent-import-path auxlo:Auxlo -o jobs --job-name latest > run.log 2>&1
+# Check results
+auxlo status
+auxlo logs
 ```
 
-## Running the meta-agent
+## CLI Commands
 
-Point your coding agent at the repo and prompt:
+| Command | Description |
+|---------|-------------|
+| `auxlo add "task description"` | Add a new task to the benchmark |
+| `auxlo run` | Run the evolution loop on all tasks |
+| `auxlo status` | Show current config, tasks, and last run |
+| `auxlo config` | Show current configuration |
+| `auxlo config --model <model>` | Change the model |
+| `auxlo config --base-url <url>` | Change the API base URL |
+| `auxlo config --api-key <key>` | Set the API key |
+| `auxlo config --list-models` | Show available preset models |
+| `auxlo logs` | Show recent evolution logs |
 
-```
-Read program.md and let's kick off a new experiment!
-```
-
-The meta-agent will read the directive, inspect the current harness, run the
-benchmark, diagnose failures, modify `auxlo.py`, and iterate.
-
-## Project structure
-
-```
-auxlo.py                       -- single-file harness under test
-  editable harness section     -- prompt, registries, tools, routing
-  fixed adapter section      -- Harbor integration + trajectory serialization
-program.md                     -- meta-agent instructions + directive
-pyproject.toml                 -- Python dependencies
-Dockerfile.base                -- container image for task execution
-docs/                          -- harness design patterns, SDK docs
-.agent/                       -- reusable context for the meta-agent
-tasks/                        -- benchmark tasks in Harbor format
-scripts/                      -- utility scripts
-```
-
-## Task format
+## How It Works
 
 ```
-tasks/my-task/
-  task.toml           -- config (timeouts, metadata)
-  instruction.md      -- prompt sent to the agent
-  tests/
-    test.sh           -- entry point, writes /logs/reward.txt
-    test.py           -- verification (deterministic or LLM-as-judge)
-  environment/
-    Dockerfile        -- task container (FROM auxlo-base)
-  files/              -- reference files mounted into container
+┌─────────────────────────────────────────────────────────────┐
+│                     EVOLUTION LOOP                            │
+│                                                              │
+│   ┌─────────┐    ┌───────────┐    ┌──────────┐              │
+│   │  Solve  │───▶│  Observe  │───▶│  Evolve  │              │
+│   │ (agent) │    │ (collect) │    │ (mutate) │              │
+│   └────▲─────┘    └───────────┘    └────┬─────┘              │
+│        │                                │                    │
+│   reads from                      writes to                  │
+│        │                                │                    │
+│   ┌────┴────────────────────────────────▼─────┐              │
+│   │              WORKSPACE (FS)               │              │
+│   │  prompts/  skills/  memory/  evolution/   │              │
+│   └──────────────────────────────────────────┘              │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-Tests write a score (0.0-1.0) to the verifier logs. The meta-agent hill-climbs
-on this.
+1. **Solve** -- Agent processes tasks using available tools
+2. **Observe** -- Collect trajectories and results into memory
+3. **Evolve** -- Analyze failures, auto-seed skills, mutate workspace
 
-## Design choices
+## Project Structure
 
-- **Program the meta-agent, not the harness directly.** The human steers the
-  loop through `program.md`, while the meta-agent edits `auxlo.py`.
-- **Single-file, registry-driven harness.** The implementation lives in one
-  file for simplicity, but agent and tool registration stay structured so the
-  harness can still evolve cleanly.
-- **Docker isolation.** The agent runs in a container. It cannot damage the host.
-- **Score-driven.** Every experiment produces a numeric score. Keep if better,
-  discard if not. Same loop as autoresearch.
-- **Harbor-compatible tasks.** Tasks use the same format as harbor benchmarks,
-  so the same harness can be evaluated on different datasets.
+```
+auxlo/
+├── __main__.py          # CLI entry point (auxlo command)
+├── .auxlo_config.json   # Saved configuration
+├── .env                 # Environment variables
+├── auxlo_agent/         # Agent workspace (auto-created)
+│   ├── prompts/         # System prompts
+│   ├── skills/          # Evolved skills (SKILL.md files)
+│   └── memory/           # Episodic memory (JSONL)
+├── tasks/               # Benchmark tasks
+│   └── *.md             # Task descriptions
+├── scripts/
+│   └── evolve.sh        # Evolution loop script
+└── results.tsv          # Run history
+```
 
-## Cleanup
+## Configuration
 
-Docker images and containers accumulate across runs. Clean up regularly:
+### Environment Variables (Recommended)
 
 ```bash
-# Harbor cached task images + task cache
-uv run harbor cache clean -f
-
-# Full Docker nuke (all unused images, build cache, etc.)
-docker system prune -a -f
-
-# Lighter: just dead containers
-docker container prune -f
+export NVIDIA_API_KEY="your-nvidia-api-key"
+export NVIDIA_BASE_URL="https://integrate.api.nvidia.com/v1"
+export AUXLO_MODEL="stepfun-ai/step-3.5-flash"
 ```
 
-## Improving performance with skills
+### Or use the CLI
 
-You can equip the agent with Agent Skills for Context Engineering and context7
-skills to improve performance. Add skills to the `.agent/` directory.
+```bash
+# Set API key
+auxlo config --api-key your-api-key
+
+# Change model
+auxlo config --model anthropic/claude-3-5-sonnet-20241022
+
+# Use a different base URL
+auxlo config --base-url https://api.anthropic.com/v1
+```
+
+### Available Preset Models
+
+- **NVIDIA:** `stepfun-ai/step-3.5-flash` (default)
+- **Anthropic:** `claude-3-5-sonnet-20241022`, `claude-3-5-haiku-20241022`
+- **OpenAI:** `gpt-4o`, `gpt-4o-mini`
+- **Google:** `gemini-2.0-flash`, `gemini-1.5-pro`
+
+## Task Format
+
+Tasks are simple markdown files in the `tasks/` directory:
+
+```markdown
+# Task
+
+Write a Python script at /tmp/hello.py that prints "Hello from Auxlo!"
+```
+
+## Evolved Skills
+
+Auxlo auto-generates skills based on failure patterns. Skills are stored in `auxlo_agent/skills/` as `SKILL.md` files:
+
+```markdown
+---
+name: error-handler
+description: TRIGGER when a command fails with timeout or permission error
+---
+
+# Error Handler Skill
+
+When a command times out or fails:
+1. Check if the command can be optimized
+2. Add appropriate timeout values
+3. Verify permissions
+4. Retry with fallbacks
+```
+
+## Git Versioning
+
+Every evolution cycle is automatically committed:
+
+```bash
+git log --oneline
+# evo-3: Auto-seeded timeout-handler skill
+# evo-2: Improved file operation skills
+# evo-1: Initial workspace setup
+```
+
+Rollback if needed:
+
+```bash
+git reset --hard evo-2  # Go back to previous version
+```
+
+## Persistence
+
+Auxlo stores state in:
+- `auxlo_agent/memory/episodic.jsonl` -- Task history
+- `auxlo_agent/skills/` -- Evolved skills
+- `auxlo_agent/prompts/` -- Current prompts
+- `results.tsv` -- Run scores
+
+## Requirements
+
+- Python 3.12+
+- `uv` package manager
+- API key for your LLM provider
+
+## License
+
+MIT
