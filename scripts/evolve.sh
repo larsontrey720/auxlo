@@ -1,6 +1,5 @@
 #!/bin/bash
 # Auxlo Autonomous Evolution Loop
-# Runs the agent on benchmark tasks, analyzes results, improves harness
 
 AUXLO_DIR="/home/workspace/auxlo"
 cd "$AUXLO_DIR"
@@ -8,66 +7,53 @@ cd "$AUXLO_DIR"
 LOG_FILE="/home/workspace/auxlo/evolve.log"
 TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
 
-echo "[$TIMESTAMP] === Auxlo Evolution Run Started ===" >> "$LOG_FILE"
-echo "[$TIMESTAMP] Current commit: $(git rev-parse --short HEAD)" >> "$LOG_FILE"
+echo "[$TIMESTAMP] === Auxlo Evolution Run Started ===" | tee -a "$LOG_FILE"
+echo "[$TIMESTAMP] Commit: $(git rev-parse --short HEAD)" | tee -a "$LOG_FILE"
 
-# Initialize results tracking
-touch results.tsv
-
-# Check if there are tasks to run
-if [ ! -d "tasks" ] || [ -z "$(ls -A tasks/ 2>/dev/null)" ]; then
-    echo "[$TIMESTAMP] No tasks found in tasks/ directory" >> "$LOG_FILE"
-    echo "[$TIMESTAMP] Creating sample task..." >> "$LOG_FILE"
-    mkdir -p tasks
-fi
-
-# Run agent on each task
 TOTAL=0
 PASSED=0
 
-for TASK_FILE in tasks/*.md tasks/*.txt 2>/dev/null; do
-    [ -e "$TASK_FILE" ] || continue
+for TASK_FILE in tasks/*.md tasks/*.txt; do
+    if [ ! -e "$TASK_FILE" ]; then
+        continue
+    fi
     
-    TASK_NAME=$(basename "$TASK_FILE" .md)
+    TASK_NAME=$(basename "$TASK_FILE")
+    TASK_NAME=${TASK_NAME%.md}
     TASK_NAME=${TASK_NAME%.txt}
     TOTAL=$((TOTAL + 1))
     
-    echo "[$TIMESTAMP] Running task: $TASK_NAME" >> "$LOG_FILE"
+    echo "[$TIMESTAMP] Running: $TASK_NAME" | tee -a "$LOG_FILE"
     
-    # Copy task to instruction location
     mkdir -p /task
     cp "$TASK_FILE" /task/instruction.md
     
-    # Run the agent
-    TASK_LOG="/tmp/auxlo_task_${TASK_NAME}.log"
-    timeout 300 uv run python auxlo.py 2>&1 | tee "$TASK_LOG"
+    # Run and capture output
+    OUTPUT=$(timeout 300 uv run python auxlo.py 2>&1)
+    echo "$OUTPUT" >> "$LOG_FILE"
     
-    # Check result (look for success indicators)
-    if grep -qi "success\|complete\|done\|passed" "$TASK_LOG" 2>/dev/null; then
+    # Check for success indicators
+    if echo "$OUTPUT" | grep -qiE "(success|complete|done|passed|task completed)"; then
         PASSED=$((PASSED + 1))
         STATUS="PASS"
     else
         STATUS="FAIL"
     fi
     
-    echo "[$TIMESTAMP] Task $TASK_NAME: $STATUS" >> "$LOG_FILE"
-    
-    # Clean up
+    echo "[$TIMESTAMP] $TASK_NAME: $STATUS" | tee -a "$LOG_FILE"
     rm -rf /task
 done
 
-# Log summary
-echo "[$TIMESTAMP] Results: $PASSED/$TOTAL tasks passed" >> "$LOG_FILE"
+echo "" | tee -a "$LOG_FILE"
+echo "[$TIMESTAMP] === SUMMARY ===" | tee -a "$LOG_FILE"
+echo "[$TIMESTAMP] Results: $PASSED/$TOTAL passed" | tee -a "$LOG_FILE"
 
-# Analyze and suggest improvements (placeholder for meta-agent logic)
+# Log to results.tsv
 if [ $TOTAL -gt 0 ]; then
-    SCORE=$(python3 -c "print($PASSED / $TOTAL)")
-    echo "[$TIMESTAMP] Score: $SCORE" >> "$LOG_FILE"
-    
-    # Log to results.tsv
     COMMIT=$(git rev-parse --short HEAD)
+    SCORE=$(python3 -c "print(round($PASSED / $TOTAL, 3))")
     echo -e "${COMMIT}\t${SCORE}\t${PASSED}/${TOTAL}\t\t\t\t" >> results.tsv
+    cat results.tsv | tail -5 >> "$LOG_FILE"
 fi
 
-echo "[$TIMESTAMP] === Run Complete ===" >> "$LOG_FILE"
-echo "" >> "$LOG_FILE"
+echo "[$TIMESTAMP] === Done ===" | tee -a "$LOG_FILE"
