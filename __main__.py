@@ -18,7 +18,9 @@ import json
 import subprocess
 from pathlib import Path
 
-AUXLO_DIR = Path(__file__).parent
+# Find actual auxlo directory (resolve symlinks)
+_AUXLO_SCRIPT = Path(__file__).resolve()
+AUXLO_DIR = _AUXLO_SCRIPT.parent
 TASKS_DIR = AUXLO_DIR / "tasks"
 CONFIG_FILE = AUXLO_DIR / ".auxlo_config.json"
 ENV_FILE = AUXLO_DIR / ".env"
