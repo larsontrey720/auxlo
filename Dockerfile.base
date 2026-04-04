@@ -1,0 +1,15 @@
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates git && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /auxlo
+
+COPY pyproject.toml ./
+RUN uv pip install --system .
+
+COPY auxlo.py ./
+
+RUN ln -sf $(which python3) /usr/local/bin/python
+RUN mkdir -p /logs /auxlo/output
