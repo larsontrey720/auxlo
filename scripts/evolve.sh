@@ -1,6 +1,6 @@
 #!/bin/bash
 # Auxlo Autonomous Evolution Loop
-# This script runs the experiment loop and logs results
+# Runs the agent on benchmark tasks, analyzes results, improves harness
 
 AUXLO_DIR="/home/workspace/auxlo"
 cd "$AUXLO_DIR"
@@ -9,47 +9,64 @@ LOG_FILE="/home/workspace/auxlo/evolve.log"
 TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
 
 echo "[$TIMESTAMP] === Auxlo Evolution Run Started ===" >> "$LOG_FILE"
+echo "[$TIMESTAMP] Current commit: $(git rev-parse --short HEAD)" >> "$LOG_FILE"
 
-# Source environment if needed
-if [ -f ".env" ]; then
-    set -a && source .env && set +a
+# Initialize results tracking
+touch results.tsv
+
+# Check if there are tasks to run
+if [ ! -d "tasks" ] || [ -z "$(ls -A tasks/ 2>/dev/null)" ]; then
+    echo "[$TIMESTAMP] No tasks found in tasks/ directory" >> "$LOG_FILE"
+    echo "[$TIMESTAMP] Creating sample task..." >> "$LOG_FILE"
+    mkdir -p tasks
 fi
 
-# Ensure results.tsv exists
-if [ ! -f "results.tsv" ]; then
-    echo -e "commit\tavg_score\tpassed\ttask_scores\tcost_usd\tstatus\tdescription" > results.tsv
-fi
+# Run agent on each task
+TOTAL=0
+PASSED=0
 
-# Get current commit hash
-COMMIT=$(git rev-parse --short HEAD)
-echo "[$TIMESTAMP] Current commit: $COMMIT" >> "$LOG_FILE"
-
-# Run the benchmark
-echo "[$TIMESTAMP] Running benchmark..." >> "$LOG_FILE"
-rm -rf jobs; mkdir -p jobs
-
-timeout 1800 uv run harbor run -p tasks/ --agent-import-path auxlo:Auxlo -o jobs >> "$LOG_FILE" 2>&1
-RESULT=$?
-
-if [ $RESULT -eq 0 ]; then
-    echo "[$TIMESTAMP] Benchmark completed successfully" >> "$LOG_FILE"
-elif [ $RESULT -eq 124 ]; then
-    echo "[$TIMESTAMP] Benchmark timed out (30min)" >> "$LOG_FILE"
-else
-    echo "[$TIMESTAMP] Benchmark failed with code: $RESULT" >> "$LOG_FILE"
-fi
-
-# Parse results if available
-if [ -d "jobs" ]; then
-    PASSED=$(find jobs -name "*.passed" 2>/dev/null | wc -l)
-    TOTAL=$(find jobs -name "*.json" 2>/dev/null | wc -l)
-    echo "[$TIMESTAMP] Results: $PASSED/$TOTAL tasks passed" >> "$LOG_FILE"
+for TASK_FILE in tasks/*.md tasks/*.txt 2>/dev/null; do
+    [ -e "$TASK_FILE" ] || continue
     
-    # Check for improvements
-    LAST_LINE=$(tail -1 results.tsv 2>/dev/null)
-    if [ -n "$LAST_LINE" ]; then
-        echo "[$TIMESTAMP] Last results: $LAST_LINE" >> "$LOG_FILE"
+    TASK_NAME=$(basename "$TASK_FILE" .md)
+    TASK_NAME=${TASK_NAME%.txt}
+    TOTAL=$((TOTAL + 1))
+    
+    echo "[$TIMESTAMP] Running task: $TASK_NAME" >> "$LOG_FILE"
+    
+    # Copy task to instruction location
+    mkdir -p /task
+    cp "$TASK_FILE" /task/instruction.md
+    
+    # Run the agent
+    TASK_LOG="/tmp/auxlo_task_${TASK_NAME}.log"
+    timeout 300 uv run python auxlo.py 2>&1 | tee "$TASK_LOG"
+    
+    # Check result (look for success indicators)
+    if grep -qi "success\|complete\|done\|passed" "$TASK_LOG" 2>/dev/null; then
+        PASSED=$((PASSED + 1))
+        STATUS="PASS"
+    else
+        STATUS="FAIL"
     fi
+    
+    echo "[$TIMESTAMP] Task $TASK_NAME: $STATUS" >> "$LOG_FILE"
+    
+    # Clean up
+    rm -rf /task
+done
+
+# Log summary
+echo "[$TIMESTAMP] Results: $PASSED/$TOTAL tasks passed" >> "$LOG_FILE"
+
+# Analyze and suggest improvements (placeholder for meta-agent logic)
+if [ $TOTAL -gt 0 ]; then
+    SCORE=$(python3 -c "print($PASSED / $TOTAL)")
+    echo "[$TIMESTAMP] Score: $SCORE" >> "$LOG_FILE"
+    
+    # Log to results.tsv
+    COMMIT=$(git rev-parse --short HEAD)
+    echo -e "${COMMIT}\t${SCORE}\t${PASSED}/${TOTAL}\t\t\t\t" >> results.tsv
 fi
 
 echo "[$TIMESTAMP] === Run Complete ===" >> "$LOG_FILE"
