@@ -5,6 +5,8 @@ __pycache__/
 *.so
 .Python
 .env
+.env.*
+!.env.example
 .venv
 env/
 venv/
@@ -17,6 +19,10 @@ build/
 # Harbor
 jobs/
 *.log
+evolve.log
+
+# Auxlo workspace (local evolution artifacts)
+auxlo_agent/
 
 # IDE
 .vscode/
@@ -31,3 +37,6 @@ Thumbs.db
 # Results
 results.tsv
 *.trajectory.json
+
+# Logs
+logs/

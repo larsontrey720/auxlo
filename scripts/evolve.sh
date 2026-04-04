@@ -4,6 +4,13 @@
 AUXLO_DIR="/home/workspace/auxlo"
 cd "$AUXLO_DIR"
 
+# Load environment variables
+if [ -f ".env" ]; then
+    set -a
+    source .env
+    set +a
+fi
+
 LOG_FILE="/home/workspace/auxlo/evolve.log"
 TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
 
@@ -28,8 +35,8 @@ for TASK_FILE in tasks/*.md tasks/*.txt; do
     mkdir -p /task
     cp "$TASK_FILE" /task/instruction.md
     
-    # Run and capture output
-    OUTPUT=$(timeout 300 uv run python auxlo.py 2>&1)
+    # Run with environment variables
+    OUTPUT=$(timeout 300 env NVIDIA_API_KEY="$NVIDIA_API_KEY" NVIDIA_BASE_URL="${NVIDIA_BASE_URL:-https://integrate.api.nvidia.com/v1}" AUXLO_MODEL="${AUXLO_MODEL:-stepfun-ai/step-3.5-flash}" uv run python auxlo.py 2>&1)
     echo "$OUTPUT" >> "$LOG_FILE"
     
     # Check for success indicators
