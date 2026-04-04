@@ -11,11 +11,16 @@ if [ -f ".env" ]; then
     set +a
 fi
 
-LOG_FILE="/home/workspace/auxlo/evolve.log"
+LOG_FILE="$AUXLO_DIR/evolve.log"
 TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
 
 echo "[$TIMESTAMP] === Auxlo Evolution Run Started ===" | tee -a "$LOG_FILE"
 echo "[$TIMESTAMP] Commit: $(git rev-parse --short HEAD)" | tee -a "$LOG_FILE"
+
+# Log self-awareness status
+MEMORY_COUNT=$(wc -l < "$AUXLO_DIR/auxlo_agent/memory/episodic.jsonl" 2>/dev/null || echo 0)
+SKILL_COUNT=$(ls -d "$AUXLO_DIR/auxlo_agent/skills"/*/SKILL.md 2>/dev/null | wc -l)
+echo "[$TIMESTAMP] Self-Awareness: $MEMORY_COUNT memories, $SKILL_COUNT skills" | tee -a "$LOG_FILE"
 
 TOTAL=0
 PASSED=0
@@ -36,7 +41,11 @@ for TASK_FILE in tasks/*.md tasks/*.txt; do
     cp "$TASK_FILE" /task/instruction.md
     
     # Run with environment variables
-    OUTPUT=$(timeout 300 env NVIDIA_API_KEY="$NVIDIA_API_KEY" NVIDIA_BASE_URL="${NVIDIA_BASE_URL:-https://integrate.api.nvidia.com/v1}" AUXLO_MODEL="${AUXLO_MODEL:-stepfun-ai/step-3.5-flash}" uv run python auxlo.py 2>&1)
+    OUTPUT=$(timeout 300 env \
+        NVIDIA_API_KEY="$NVIDIA_API_KEY" \
+        NVIDIA_BASE_URL="${NVIDIA_BASE_URL:-https://integrate.api.nvidia.com/v1}" \
+        AUXLO_MODEL="${AUXLO_MODEL:-stepfun-ai/step-3.5-flash}" \
+        uv run python auxlo_agent.py 2>&1)
     echo "$OUTPUT" >> "$LOG_FILE"
     
     # Check for success indicators
