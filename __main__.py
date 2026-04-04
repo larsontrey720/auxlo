@@ -196,6 +196,33 @@ if __name__ == "__main__":
         cmd_status()
         sys.exit(0)
     
+    elif cmd == "evolve":
+        # Run full evolution cycle
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("evolution", AUXLO_DIR / "evolution.py")
+        evo_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(evo_module)
+        
+        task_files = list(TASKS_DIR.glob("*.md"))
+        if not task_files:
+            print("No tasks found. Add tasks with `auxlo add` first.")
+            sys.exit(1)
+        
+        tasks = [f.read_text().strip() for f in task_files]
+        print(f"Running evolution on {len(tasks)} tasks...")
+        
+        engine = evo_module.EvolutionEngine()
+        result = engine.run_cycle(tasks)
+        
+        print(f"\n=== Result ===")
+        print(f"Train Score: {result['train_score']:.2%}")
+        if result.get('holdout_score'):
+            print(f"Holdout Score: {result['holdout_score']:.2%}")
+        if result.get('mutation'):
+            print(f"Mutation: {result['mutation']}")
+        
+        sys.exit(0)
+    
     elif cmd == "logs":
         lines = int(sys.argv[2]) if len(sys.argv) > 2 else 20
         cmd_logs(lines)

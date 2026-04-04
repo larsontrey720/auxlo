@@ -230,40 +230,103 @@ def sync_memory():
 # CONTEXT BUILDER
 # ============================================================================
 
-def build_context(task_description: str = "") -> str:
-    """Build full context from hybrid memory."""
-    parts = []
+def build_context(query: str = "", max_tokens: int = 500) -> str:
+    """Build context from hybrid memory for the agent.
     
-    # Tier 1: Recent tasks
-    recent = load_recent_tasks()
-    if recent:
-        parts.append("=== RECENT TASKS (Full Detail) ===")
-        for t in recent[-10:]:  # Last 10 in context
-            status = "PASS" if t.get("success") else "FAIL"
-            parts.append(f"[{status}] {t.get('task', '')[:80]}")
-        parts.append("")
+    Includes:
+    - Recent tasks (full detail, last 20)
+    - Older task summaries (single lines)  
+    - Semantic search matches (shows FULL detail if query matches index)
     
-    # Tier 2: Compressed summaries
-    summaries = load_summaries()
-    if summaries:
-        parts.append("=== LESSONS LEARNED ===")
-        for s in summaries[-20:]:  # Last 20 lessons
-            parts.append(s)
-        parts.append("")
+    This keeps context bounded while ensuring older memories can be retrieved.
+    """
+    lines = []
+    lines.append("=== RECENT TASKS (Full Detail) ===")
     
-    # Tier 3: Semantic search results
-    if task_description:
-        index = load_index()
-        if index:
-            results = semantic_search(task_description, index)
-            if results:
-                parts.append("=== RELEVANT PAST EXPERIENCES ===")
-                for r in results:
-                    status = "PASS" if r.get("success") else "FAIL"
-                    parts.append(f"[{status}] {r.get('title', '')}: {r.get('content', '')[:100]}")
-                parts.append("")
+    memories_dir = Path(MEMORY_DIR)
+    episodic_file = memories_dir / "episodic.jsonl"
+    summaries_file = memories_dir / "summaries.txt"
+    index_file = memories_dir / "index.jsonl"
     
-    return "\n".join(parts) if parts else "No previous history yet."
+    # Tier 1: Recent 20 tasks (full detail)
+    recent_count = 0
+    if episodic_file.exists():
+        with open(episodic_file) as f:
+            lines_ = f.readlines()
+            for line in lines_[-20:]:
+                if line.strip():
+                    entry = json.loads(line)
+                    task = entry.get("task", "")[:100]
+                    result = entry.get("result", "")[:80]
+                    success = "PASS" if entry.get("success") else "FAIL"
+                    lines.append(f"[{success}] {task}")
+                    lines.append(f"  Result: {result}")
+                    recent_count += 1
+    
+    lines.append(f"\n(Showing {recent_count} most recent tasks)\n")
+    
+    # Tier 2: Older task summaries (only if query is empty - avoid spam)
+    if not query and summaries_file.exists():
+        with open(summaries_file) as f:
+            summary_lines = f.readlines()
+            # Show last 50 summaries only
+            for line in summary_lines[-50:]:
+                if line.strip() and not any(line.startswith(x) for x in lines[-20:]):
+                    lines.append(line.strip())
+    
+    # Tier 3: Semantic search - SHOW FULL DETAIL for matching entries
+    if query and index_file.exists():
+        query_lower = query.lower()
+        with open(index_file) as f:
+            for line in f:
+                if line.strip():
+                    try:
+                        entry = json.loads(line)
+                        content = entry.get("content", "").lower()
+                        title = entry.get("title", "").lower()
+                        
+                        # Enhanced matching: substring + word overlap
+                        query_words = set(query_lower.split())
+                        content_words = set(content.split()) | set(title.split())
+                        
+                        # Check various matches
+                        match = False
+                        
+                        # 1. Substring in content or title
+                        if query_lower in content or query_lower in title:
+                            match = True
+                        
+                        # 2. Each query word matches
+                        for word in query_words:
+                            if len(word) >= 3 and (word in content or word in title):
+                                match = True
+                                break
+                        
+                        # 3. Numeric query (e.g., "task_7" -> match "7")
+                        for word in query_words:
+                            if word.isdigit() and word in content:
+                                match = True
+                                break
+                            # Handle task_X format
+                            if '_' in word:
+                                parts = word.split('_')
+                                for p in parts:
+                                    if p.isdigit() and p in content:
+                                        match = True
+                                        break
+                        
+                        if match:
+                            # Found! Show full detail
+                            lines.append(f"\n=== MEMORY MATCH ===")
+                            lines.append(f"Title: {entry.get('title', '')}")
+                            lines.append(f"Timestamp: {entry.get('timestamp', '')}")
+                            lines.append(f"Success: {entry.get('success', False)}")
+                            lines.append(f"Content: {entry.get('content', '')}")
+                            
+                    except json.JSONDecodeError:
+                        continue
+    
+    return "\n".join(lines)
 
 # ============================================================================
 # TASK MEMORY
