@@ -1,245 +1,438 @@
 #!/usr/bin/env python3
-"""Auxlo Agent - Self-aware autonomous agent with memory and skills."""
+"""Auxlo Agent - Self-aware autonomous agent with hybrid memory."""
 
 import json
 import os
 import subprocess
-from datetime import datetime, timezone
+import re
+import hashlib
+from datetime import datetime
 from pathlib import Path
 from openai import OpenAI
 
 # ============================================================================
-# CONFIGURATION
+# CONFIG
 # ============================================================================
 
-def get_config():
-    """Load config from .auxlo_config.json or env vars."""
-    config_path = Path(__file__).parent / ".auxlo_config.json"
-    if config_path.exists():
-        return json.loads(config_path.read_text())
-    return {
-        "model": os.environ.get("AUXLO_MODEL", "stepfun-ai/step-3.5-flash"),
-        "base_url": os.environ.get("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"),
-        "api_key": os.environ.get("NVIDIA_API_KEY", ""),
-    }
+MODEL = os.environ.get("AUXLO_MODEL", "stepfun-ai/step-3.5-flash")
+BASE_URL = os.environ.get("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
+API_KEY = os.environ.get("NVIDIA_API_KEY", "")
+SYSTEM_PROMPT = os.environ.get("AUXLO_SYSTEM_PROMPT", "")
+
+AGENT_DIR = Path(__file__).parent
+MEMORY_DIR = AGENT_DIR / "memory"
+MEMORY_DIR.mkdir(exist_ok=True)
+EPISODIC_FILE = MEMORY_DIR / "episodic.jsonl"
+SUMMARIES_FILE = MEMORY_DIR / "summaries.txt"
+INDEX_FILE = MEMORY_DIR / "index.jsonl"
+
+MAX_RECENT_TASKS = 20
+MAX_SUMMARY_LINES = 100
+MAX_RETRIEVAL_RESULTS = 5
 
 # ============================================================================
-# WORKSPACE MANAGEMENT
+# OPENAI CLIENT
 # ============================================================================
 
-class Workspace:
-    """Manages the agent's persistent workspace."""
-    
-    def __init__(self, root=None):
-        self.root = root or Path(__file__).parent / "auxlo_agent"
-        self.prompts_dir = self.root / "prompts"
-        self.skills_dir = self.root / "skills"
-        self.memory_dir = self.root / "memory"
-        self.memory_file = self.memory_dir / "episodic.jsonl"
-        
-        # Create directories
-        for d in [self.prompts_dir, self.skills_dir, self.memory_dir]:
-            d.mkdir(parents=True, exist_ok=True)
-    
-    def read_memory(self, limit=50):
-        """Read recent memory entries."""
-        if not self.memory_file.exists():
-            return []
-        lines = self.memory_file.read_text().strip().split("\n")
-        entries = [json.loads(l) for l in lines if l.strip()]
-        return entries[-limit:]
-    
-    def write_memory(self, entry):
-        """Write a memory entry."""
-        entry["timestamp"] = datetime.now(timezone.utc).isoformat()
-        with open(self.memory_file, "a") as f:
-            f.write(json.dumps(entry) + "\n")
-    
-    def read_skills(self):
-        """Read all skills."""
-        skills = []
-        for skill_file in self.skills_dir.glob("*/SKILL.md"):
-            name = skill_file.parent.name
-            content = skill_file.read_text()
-            skills.append({"name": name, "content": content})
-        return skills
-    
-    def read_system_prompt(self):
-        """Read the system prompt."""
-        prompt_file = self.prompts_dir / "system.md"
-        if prompt_file.exists():
-            return prompt_file.read_text()
-        return None
-    
-    def write_system_prompt(self, content):
-        """Write the system prompt."""
-        prompt_file = self.prompts_dir / "system.md"
-        prompt_file.write_text(content)
+client = OpenAI(api_key=API_KEY, base_url=BASE_URL) if API_KEY else None
 
 # ============================================================================
-# SELF-AWARE AGENT
+# HYBRID MEMORY SYSTEM
 # ============================================================================
 
-class SelfAwareAgent:
-    """Agent with full awareness of its history and capabilities."""
+def load_recent_tasks(n: int = MAX_RECENT_TASKS) -> list[dict]:
+    """Tier 1: Load last n tasks with full detail."""
+    if not EPISODIC_FILE.exists():
+        return []
     
-    def __init__(self, config=None):
-        self.config = config or get_config()
-        self.workspace = Workspace()
-        self.client = OpenAI(
-            api_key=self.config["api_key"],
-            base_url=self.config["base_url"]
+    tasks = []
+    lines = EPISODIC_FILE.read_text().strip().split("\n")
+    for line in reversed(lines):
+        if line.strip():
+            try:
+                tasks.append(json.loads(line))
+            except:
+                pass
+        if len(tasks) >= n:
+            break
+    return list(reversed(tasks))
+
+def compress_task_to_summary(task: dict) -> str:
+    """Compress a task into a single line summary."""
+    task_text = task.get("task", "")[:100]
+    success = "SUCCESS" if task.get("success") else "FAIL"
+    result_preview = task.get("result", "")[:50].replace("\n", " ")
+    
+    # Extract key lessons
+    lessons = []
+    if not task.get("success"):
+        if "permission" in result_preview.lower() or "denied" in result_preview.lower():
+            lessons.append("Permission errors")
+        if "timeout" in result_preview.lower():
+            lessons.append("Timeout issues")
+        if "not found" in result_preview.lower():
+            lessons.append("Path not found")
+    
+    lesson_str = f" | {', '.join(lessons)}" if lessons else ""
+    
+    return f"{task.get('timestamp', '')[:10]} | {success} | {task_text}...{lesson_str}"
+
+def load_summaries() -> list[str]:
+    """Tier 2: Load compressed summaries of older tasks."""
+    if not SUMMARIES_FILE.exists():
+        return []
+    
+    lines = SUMMARIES_FILE.read_text().strip().split("\n")
+    return [l for l in lines if l.strip()]
+
+def save_summaries(summaries: list[str]):
+    """Save summaries, capped at max lines."""
+    if len(summaries) > MAX_SUMMARY_LINES:
+        summaries = summaries[-MAX_SUMMARY_LINES:]
+    SUMMARIES_FILE.write_text("\n".join(summaries) + "\n")
+
+def add_to_summaries(task: dict):
+    """Add a new task to the summaries file."""
+    summary = compress_task_to_summary(task)
+    summaries = load_summaries()
+    summaries.append(summary)
+    save_summaries(summaries)
+
+def extract_indexable_content(task: dict) -> str:
+    """Extract key content for semantic search."""
+    parts = [
+        task.get("task", ""),
+        task.get("result", ""),
+        "SUCCESS" if task.get("success") else "FAIL"
+    ]
+    return " | ".join(parts)
+
+def load_index() -> list[dict]:
+    """Tier 3: Load semantic search index."""
+    if not INDEX_FILE.exists():
+        return []
+    
+    index = []
+    lines = INDEX_FILE.read_text().strip().split("\n")
+    for line in lines:
+        if line.strip():
+            try:
+                index.append(json.loads(line))
+            except:
+                pass
+    return index
+
+def save_index(index: list[dict]):
+    """Save semantic search index."""
+    INDEX_FILE.write_text("\n".join(json.dumps(i) for i in index) + "\n")
+
+def generate_embedding(text: str) -> list[float]:
+    """Generate embedding for text using the model."""
+    if not client:
+        # Fallback: simple hash-based "embedding"
+        return [float(int(hashlib.md5(text.encode()).hexdigest()[:8], 16)) / 0xFFFFFFFF]
+    
+    try:
+        response = client.embeddings.create(
+            model="nvidia/nv-embed-qa-4",
+            input=text
         )
-    
-    def build_system_prompt(self):
-        """Build a system prompt with full self-awareness."""
-        parts = []
-        
-        # Base instructions
-        parts.append("""You are a highly capable task-completion agent. You solve tasks by reading instructions, executing code, and producing output files.
+        return response.data[0].embedding
+    except:
+        # Fallback for non-NVIDIA providers
+        return [float(int(hashlib.sha256(text.encode()).hexdigest()[:8], 16)) / 0xFFFFFFFF]
 
-## Your Tools
-You have access to shell commands via the run_bash_command tool.
+def cosine_sim(a: list[float], b: list[float]) -> float:
+    """Compute cosine similarity between two vectors."""
+    if len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(x * x for x in b) ** 0.5
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+def semantic_search(query: str, index: list[dict], top_k: int = MAX_RETRIEVAL_RESULTS) -> list[dict]:
+    """Search index for relevant entries."""
+    if not index:
+        return []
+    
+    query_embedding = generate_embedding(query)
+    
+    results = []
+    for item in index:
+        content_emb = item.get("embedding", [])
+        if content_emb:
+            sim = cosine_sim(query_embedding, content_emb)
+            results.append((sim, item))
+    
+    results.sort(key=lambda x: x[0], reverse=True)
+    return [item for _, item in results[:top_k]]
+
+def add_to_index(task: dict):
+    """Add a task to the semantic index."""
+    index = load_index()
+    
+    content = extract_indexable_content(task)
+    embedding = generate_embedding(content)
+    
+    # Create title from task
+    task_text = task.get("task", "")[:50]
+    title = re.sub(r"[^a-z0-9 ]", "", task_text.lower()).replace(" ", "_")[:30]
+    
+    entry = {
+        "timestamp": task.get("timestamp", ""),
+        "title": title,
+        "content": content,
+        "embedding": embedding,
+        "success": task.get("success", False)
+    }
+    
+    index.append(entry)
+    
+    # Cap index at 500 entries
+    if len(index) > 500:
+        index = index[-500:]
+    
+    save_index(index)
+
+def sync_memory():
+    """Sync episodic memory to summaries and index."""
+    if not EPISODIC_FILE.exists():
+        return
+    
+    all_tasks = []
+    lines = EPISODIC_FILE.read_text().strip().split("\n")
+    for line in lines:
+        if line.strip():
+            try:
+                all_tasks.append(json.loads(line))
+            except:
+                pass
+    
+    # Update summaries (keep all compressed)
+    existing_summaries = {s[:20] for s in load_summaries()}  # dedup by date
+    
+    # Only add tasks older than last 20
+    old_tasks = all_tasks[:-MAX_RECENT_TASKS] if len(all_tasks) > MAX_RECENT_TASKS else []
+    
+    for task in old_tasks:
+        summary = compress_task_to_summary(task)
+        if summary[:20] not in existing_summaries:
+            existing_summaries.add(summary[:20])
+            summaries = load_summaries()
+            summaries.append(summary)
+            save_summaries(summaries)
+            add_to_index(task)
+
+# ============================================================================
+# CONTEXT BUILDER
+# ============================================================================
+
+def build_context(task_description: str = "") -> str:
+    """Build full context from hybrid memory."""
+    parts = []
+    
+    # Tier 1: Recent tasks
+    recent = load_recent_tasks()
+    if recent:
+        parts.append("=== RECENT TASKS (Full Detail) ===")
+        for t in recent[-10:]:  # Last 10 in context
+            status = "PASS" if t.get("success") else "FAIL"
+            parts.append(f"[{status}] {t.get('task', '')[:80]}")
+        parts.append("")
+    
+    # Tier 2: Compressed summaries
+    summaries = load_summaries()
+    if summaries:
+        parts.append("=== LESSONS LEARNED ===")
+        for s in summaries[-20:]:  # Last 20 lessons
+            parts.append(s)
+        parts.append("")
+    
+    # Tier 3: Semantic search results
+    if task_description:
+        index = load_index()
+        if index:
+            results = semantic_search(task_description, index)
+            if results:
+                parts.append("=== RELEVANT PAST EXPERIENCES ===")
+                for r in results:
+                    status = "PASS" if r.get("success") else "FAIL"
+                    parts.append(f"[{status}] {r.get('title', '')}: {r.get('content', '')[:100]}")
+                parts.append("")
+    
+    return "\n".join(parts) if parts else "No previous history yet."
+
+# ============================================================================
+# TASK MEMORY
+# ============================================================================
+
+def log_task(task: str, result: str, success: bool, error: str = ""):
+    """Log a completed task to episodic memory."""
+    entry = {
+        "task": task,
+        "result": result,
+        "success": success,
+        "error": error,
+        "timestamp": datetime.now().isoformat()
+    }
+    
+    with open(EPISODIC_FILE, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+    
+    # Sync to summaries and index
+    add_to_summaries(entry)
+    add_to_index(entry)
+
+# ============================================================================
+# AGENT
+# ============================================================================
+
+def chat(messages: list, tools: list = None, max_tokens: int = 2048) -> dict:
+    """Call the API."""
+    if not client:
+        return {"error": "No API client configured"}
+    
+    try:
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            tools=tools,
+            max_tokens=max_tokens,
+            temperature=0.7
+        )
+        return response
+    except Exception as e:
+        return {"error": str(e)}
+
+def run_agent_loop(task: str) -> dict:
+    """Run the agent on a task with full memory awareness."""
+    # Build memory context
+    memory_context = build_context(task)
+    
+    # Full system prompt with memory
+    system = f"""You are a highly capable task-completion agent.
+
+{memory_context}
 
 ## Approach
-1. Read /task/instruction.md to understand what's required.
-2. Execute commands to complete the task.
-3. Write output files to the exact paths specified.
-4. Verify your output before finishing.
-5. End with "Task completed successfully." when done.
-""")
-        
-        # Add previous task memory
-        memory = self.workspace.read_memory()
-        if memory:
-            parts.append("\n## Previous Task History")
-            parts.append("Recent task outcomes that inform your approach:")
-            for entry in memory[-10:]:
-                status = "✓" if entry.get("success") else "✗"
-                task = entry.get("task", "unknown")[:60]
-                error = entry.get("error", "")[:100]
-                parts.append(f"- {status} {task} | {error}")
-        
-        # Add evolved skills
-        skills = self.workspace.read_skills()
-        if skills:
-            parts.append(f"\n## Evolved Skills ({len(skills)} available)")
-            for skill in skills[:10]:
-                # Extract description from frontmatter
-                content = skill["content"]
-                desc_match = content.split("---")[1] if "---" in content else ""
-                desc = ""
-                if "description:" in desc_match:
-                    desc = desc_match.split("description:")[1].split("\n")[0].strip()
-                parts.append(f"- **{skill['name']}**: {desc or 'Custom skill'}")
-        
-        return "\n".join(parts)
+1. Review your task history above
+2. Learn from past successes and failures
+3. Execute the task efficiently
+4. Report results clearly
+
+## Output Format
+End with:
+- SUCCESS: [what you did] or
+- FAIL: [why it failed]"""
+
+    if SYSTEM_PROMPT:
+        system = SYSTEM_PROMPT + "\n\n" + memory_context
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": task}
+    ]
     
-    def solve(self, task_instruction):
-        """Solve a single task with full awareness."""
-        # Store task start
-        task_entry = {
-            "task": task_instruction[:100],
-            "started_at": datetime.now(timezone.utc).isoformat(),
-            "success": False,
-            "error": ""
-        }
-        
-        try:
-            # Build aware system prompt
-            system_prompt = self.build_system_prompt()
-            
-            # Read instruction
-            if os.path.exists("/task/instruction.md"):
-                with open("/task/instruction.md") as f:
-                    task_instruction = f.read().strip()
-            
-            # Run agent loop
-            result = self.run_loop(system_prompt, task_instruction)
-            
-            # Record success
-            task_entry["success"] = True
-            task_entry["result"] = result[:500]
-            
-        except Exception as e:
-            task_entry["success"] = False
-            task_entry["error"] = str(e)[:200]
-        
-        # Write to memory
-        self.workspace.write_memory(task_entry)
-        
-        return task_entry
-    
-    def run_loop(self, system_prompt, task_instruction):
-        """Run the agent loop with tool calling."""
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": task_instruction}
-        ]
-        
-        tools = [{
-            "type": "function",
-            "function": {
-                "name": "run_bash_command",
-                "description": "Execute a shell command and return stdout/stderr",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "command": {"type": "string", "description": "The shell command to execute"}
-                    },
-                    "required": ["command"]
-                }
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "run_bash_command",
+            "description": "Execute a shell command",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "timeout": {"type": "integer", "default": 120}
+                },
+                "required": ["command"]
             }
-        }]
+        }
+    }]
+    
+    trajectory = []
+    turns = 0
+    max_turns = 30
+    
+    while turns < max_turns:
+        turns += 1
+        response = chat(messages, tools=tools)
         
-        for turn in range(30):
-            response = self.client.chat.completions.create(
-                model=self.config["model"],
-                messages=messages,
-                tools=tools,
-                max_tokens=2048,
-                temperature=0.7
-            )
-            
-            msg = response.choices[0].message
-            content = msg.content or getattr(msg, 'reasoning_content', None) or ""
-            
-            # Handle tool calls
-            if msg.tool_calls:
-                for tc in msg.tool_calls:
-                    tool_name = tc.function.name
-                    args = json.loads(tc.function.arguments)
-                    
-                    # Execute
+        if "error" in response:
+            return {"success": False, "error": response["error"], "result": ""}
+        
+        choice = response.choices[0]
+        msg = choice.message
+        content = msg.content or getattr(msg, "reasoning_content", None) or ""
+        
+        if msg.tool_calls:
+            for tc in msg.tool_calls:
+                tool_name = tc.function.name
+                args = json.loads(tc.function.arguments)
+                
+                # Execute tool
+                try:
                     result = subprocess.run(
-                        args["command"], shell=True, capture_output=True, text=True, timeout=120
+                        args["command"],
+                        shell=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=args.get("timeout", 120)
                     )
-                    output = result.stdout + (f"\nSTDERR: {result.stderr}" if result.stderr else "")
-                    
-                    # Truncate if long
-                    if len(output) > 2000:
-                        output = output[:2000] + f"\n... [truncated]"
-                    
-                    messages.append({
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [{"id": tc.id, "type": "function", "function": {"name": tool_name, "arguments": tc.function.arguments}}]
-                    })
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": output
-                    })
-            else:
-                return content
-        
-        return "Max turns exceeded"
+                    tool_result = result.stdout + result.stderr if result.stderr else result.stdout
+                    if len(tool_result) > 2000:
+                        tool_result = tool_result[:2000] + f"\n... [{len(tool_result)-2000} chars truncated]"
+                except subprocess.TimeoutExpired:
+                    tool_result = "ERROR: Command timed out"
+                except Exception as e:
+                    tool_result = f"ERROR: {e}"
+                
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{"id": tc.id, "type": "function", "function": {"name": tool_name, "arguments": tc.function.arguments}}]
+                })
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": tool_result})
+                trajectory.append({"tool": tool_name, "args": args, "result": tool_result})
+        else:
+            trajectory.append({"response": content})
+            # Determine success
+            success = "SUCCESS" in content or "Task completed" in content
+            log_task(task, content, success)
+            return {"success": success, "result": content, "trajectory": trajectory}
+    
+    log_task(task, "Max turns exceeded", False)
+    return {"success": False, "error": "Max turns exceeded", "result": "", "trajectory": trajectory}
 
 # ============================================================================
 # MAIN
 # ============================================================================
 
 if __name__ == "__main__":
-    agent = SelfAwareAgent()
-    result = agent.solve("")
-    print(json.dumps(result, indent=2))
+    import sys
+    
+    task = ""
+    if len(sys.argv) > 1:
+        task = sys.argv[1]
+    elif Path("/task/instruction.md").exists():
+        task = Path("/task/instruction.md").read_text().strip()
+    
+    if not task:
+        print(json.dumps({"error": "No task provided"}))
+        sys.exit(1)
+    
+    started = datetime.now().isoformat()
+    result = run_agent_loop(task)
+    
+    output = {
+        "task": task,
+        "started_at": started,
+        "success": result.get("success", False),
+        "error": result.get("error", ""),
+        "result": result.get("result", ""),
+        "timestamp": datetime.now().isoformat()
+    }
+    
+    print(json.dumps(output, indent=2))
